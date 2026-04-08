@@ -201,13 +201,13 @@ let labelLayer = null;
 const mapTransform = {
   scale: 1,
   x: 0,
-  y: 0,
-  targetScale: 1,
-  targetX: 0,
-  targetY: 0
+  y: 0
 };
-let dragState = null;
-let animationFrameId = null;
+const activePointers = new Map();
+let panState = null;
+let pinchState = null;
+let transformFrame = 0;
+let transitionClearTimer = 0;
 
 function loadPlots() {
   try {
@@ -309,36 +309,53 @@ function buildDetailPill(label, value) {
 }
 
 function clampScale(value) {
-  return Math.min(4, Math.max(0.8, value));
+  return Math.min(3.2, Math.max(1, value));
 }
 
-function lerp(start, end, t) {
-  return start + (end - start) * t;
-}
+function clampPan(nextX = mapTransform.x, nextY = mapTransform.y, nextScale = mapTransform.scale) {
+  if (!mapViewport) {
+    return { x: nextX, y: nextY };
+  }
 
-function animateTransform() {
-  if (!mapScene) return;
+  const viewportWidth = mapViewport.clientWidth;
+  const viewportHeight = mapViewport.clientHeight;
+  const scaledWidth = viewportWidth * nextScale;
+  const scaledHeight = viewportHeight * nextScale;
 
-  const smoothness = 0.15;
-  const scaleChanged = Math.abs(mapTransform.scale - mapTransform.targetScale) > 0.001;
-  const xChanged = Math.abs(mapTransform.x - mapTransform.targetX) > 0.5;
-  const yChanged = Math.abs(mapTransform.y - mapTransform.targetY) > 0.5;
-
-  if (scaleChanged || xChanged || yChanged) {
-    if (scaleChanged) {
-      mapTransform.scale = lerp(mapTransform.scale, mapTransform.targetScale, smoothness);
-    }
-    if (xChanged) {
-      mapTransform.x = lerp(mapTransform.x, mapTransform.targetX, smoothness);
-    }
-    if (yChanged) {
-      mapTransform.y = lerp(mapTransform.y, mapTransform.targetY, smoothness);
-    }
-
-    mapScene.style.transform = `translate(${mapTransform.x}px, ${mapTransform.y}px) scale(${mapTransform.scale})`;
-    animationFrameId = requestAnimationFrame(animateTransform);
+  if (scaledWidth <= viewportWidth) {
+    nextX = (viewportWidth - scaledWidth) / 2;
   } else {
-    animationFrameId = null;
+    const minX = viewportWidth - scaledWidth;
+    nextX = Math.min(0, Math.max(minX, nextX));
+  }
+
+  if (scaledHeight <= viewportHeight) {
+    nextY = (viewportHeight - scaledHeight) / 2;
+  } else {
+    const minY = viewportHeight - scaledHeight;
+    nextY = Math.min(0, Math.max(minY, nextY));
+  }
+
+  return { x: nextX, y: nextY };
+}
+
+function setAnimatedTransform(enabled) {
+  if (!mapScene) {
+    return;
+  }
+
+  mapScene.classList.toggle('is-animating', enabled);
+
+  if (transitionClearTimer) {
+    window.clearTimeout(transitionClearTimer);
+    transitionClearTimer = 0;
+  }
+
+  if (enabled) {
+    transitionClearTimer = window.setTimeout(() => {
+      mapScene.classList.remove('is-animating');
+      transitionClearTimer = 0;
+    }, 220);
   }
 }
 
@@ -347,13 +364,44 @@ function applyMapTransform() {
     return;
   }
 
-  mapTransform.targetScale = mapTransform.scale;
-  mapTransform.targetX = mapTransform.x;
-  mapTransform.targetY = mapTransform.y;
+  mapScene.style.transform = `translate3d(${mapTransform.x}px, ${mapTransform.y}px, 0) scale(${mapTransform.scale})`;
+}
 
-  if (animationFrameId === null) {
-    animateTransform();
+function scheduleMapTransform() {
+  if (transformFrame) {
+    return;
   }
+
+  transformFrame = window.requestAnimationFrame(() => {
+    transformFrame = 0;
+    applyMapTransform();
+  });
+}
+
+function getViewportPoint(clientX, clientY) {
+  const rect = mapViewport.getBoundingClientRect();
+  return {
+    x: clientX - rect.left,
+    y: clientY - rect.top
+  };
+}
+
+function getWorldPoint(viewportX, viewportY, scale = mapTransform.scale, x = mapTransform.x, y = mapTransform.y) {
+  return {
+    x: (viewportX - x) / scale,
+    y: (viewportY - y) / scale
+  };
+}
+
+function distanceBetween(a, b) {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function centerBetween(a, b) {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2
+  };
 }
 
 function zoomMap(factor, centerX, centerY) {
@@ -366,27 +414,25 @@ function zoomMap(factor, centerX, centerY) {
   const originY = centerY ?? rect.top + rect.height / 2;
   const pointerX = originX - rect.left;
   const pointerY = originY - rect.top;
-  const nextScale = clampScale(mapTransform.targetScale * factor);
+  const nextScale = clampScale(mapTransform.scale * factor);
   const worldX = (pointerX - mapTransform.x) / mapTransform.scale;
   const worldY = (pointerY - mapTransform.y) / mapTransform.scale;
 
-  mapTransform.targetScale = nextScale;
-  mapTransform.targetX = pointerX - worldX * nextScale;
-  mapTransform.targetY = pointerY - worldY * nextScale;
-
-  if (animationFrameId === null) {
-    animateTransform();
-  }
+  mapTransform.scale = nextScale;
+  const clampedPan = clampPan(pointerX - worldX * nextScale, pointerY - worldY * nextScale, nextScale);
+  mapTransform.x = clampedPan.x;
+  mapTransform.y = clampedPan.y;
+  setAnimatedTransform(true);
+  scheduleMapTransform();
 }
 
 function resetMapTransform() {
-  mapTransform.targetScale = 1;
-  mapTransform.targetX = 0;
-  mapTransform.targetY = 0;
   mapTransform.scale = 1;
-  mapTransform.x = 0;
-  mapTransform.y = 0;
-  applyMapTransform();
+  const clampedPan = clampPan(0, 0, 1);
+  mapTransform.x = clampedPan.x;
+  mapTransform.y = clampedPan.y;
+  setAnimatedTransform(true);
+  scheduleMapTransform();
 }
 
 function openModal(plot) {
@@ -455,19 +501,16 @@ function polygonFromShape(shape) {
 function styleShape(shape, plot, visible, selected, hovered) {
   shape.classList.add('plot-shape');
   const emphasized = selected || hovered;
-  const baseOpacity = statusOpacity(plot.status);
-
-  // Cleaner, more visible plot styling
-  shape.style.fill = emphasized ? 'rgba(23,59,103,0.95)' : sizeFill(plot.sizeType);
-  shape.style.opacity = visible ? String(emphasized ? 0.85 : baseOpacity) : '0.08';
-  shape.style.stroke = emphasized ? 'rgba(11,31,54,0.95)' : 'rgba(255,255,255,0.4)';
-  shape.style.strokeWidth = emphasized ? '3' : (visible ? '1.2' : '0');
+  shape.style.fill = emphasized ? 'rgba(23,59,103,0.92)' : sizeFill(plot.sizeType);
+  shape.style.opacity = visible ? String(emphasized ? 0.78 : statusOpacity(plot.status)) : '0.05';
+  shape.style.stroke = emphasized ? 'rgba(11,31,54,0.95)' : 'none';
+  shape.style.strokeWidth = emphasized ? '2.8' : '0';
   shape.style.vectorEffect = 'non-scaling-stroke';
   shape.style.filter = visible
     ? emphasized
-      ? 'brightness(0.92) saturate(1.25)'
-      : 'brightness(1.05) saturate(1.1)'
-    : 'grayscale(0.3) brightness(0.85)';
+      ? 'brightness(0.95) saturate(1.2)'
+      : 'brightness(1.02)'
+    : 'grayscale(0.25) brightness(0.95)';
 }
 
 function renderLabels(activeIds) {
@@ -482,16 +525,18 @@ function renderLabels(activeIds) {
     const visible = activeIds.has(plot.id);
     const isSold = plot.status === 'sold';
     const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    const fontSize = Math.max(20, Math.min(40, Math.min(box.width, box.height) * 0.34));
+
     label.setAttribute('x', String(box.x + box.width / 2));
     label.setAttribute('y', String(box.y + box.height / 2));
     label.setAttribute('text-anchor', 'middle');
     label.setAttribute('dominant-baseline', 'middle');
-    label.setAttribute('font-size', box.width < 120 ? '40' : '48');
+    label.setAttribute('font-size', String(Math.round(fontSize)));
     label.setAttribute('font-weight', '800');
-    label.setAttribute('fill', 'rgba(18,28,36,0.88)');
+    label.setAttribute('fill', 'rgba(16, 25, 34, 0.92)');
     label.setAttribute('paint-order', 'stroke');
-    label.setAttribute('stroke', 'rgba(255,255,255,0.72)');
-    label.setAttribute('stroke-width', '1.4');
+    label.setAttribute('stroke', 'rgba(255,255,255,0.78)');
+    label.setAttribute('stroke-width', '1.8');
     label.style.pointerEvents = 'none';
     label.style.userSelect = 'none';
     label.style.opacity = visible ? '0.98' : '0.14';
@@ -596,11 +641,14 @@ async function initializeMap() {
   svgRoot.querySelectorAll('path').forEach((path) => path.remove());
 
   const sourceShapes = Array.from(svgRoot.querySelectorAll('polygon.cls-1, rect.cls-1')).map(polygonFromShape);
+  const orderedPlots = PLOT_NUMBER_BY_SHAPE_INDEX.map((plotNumber) =>
+    plots.find((plot) => plot.plotNumber === plotNumber)
+  ).filter(Boolean);
 
-  plotShapePairs = plots.map((plot, index) => ({
-    plot,
-    shape: sourceShapes[index]
-  }));
+  plotShapePairs = sourceShapes.map((shape, index) => ({
+    plot: orderedPlots[index],
+    shape
+  })).filter((entry) => entry.plot);
 
   plotShapePairs.forEach(({ plot, shape }) => {
     shape.style.cursor = 'pointer';
@@ -618,8 +666,6 @@ async function initializeMap() {
       state.selectedPlotId = plot.id;
       openModal(plot);
       renderMap();
-      // Reset zoom when opening modal for clean full view
-      resetMapTransform();
     });
   });
 
@@ -630,6 +676,7 @@ async function initializeMap() {
   mapCanvas.innerHTML = '';
   mapCanvas.appendChild(svgRoot);
   populateAdminPlotOptions();
+  resetMapTransform();
   renderMap();
 }
 
@@ -659,39 +706,124 @@ if (mapViewport) {
   );
 
   mapViewport.addEventListener('pointerdown', (event) => {
-    if (event.target instanceof HTMLElement && event.target.closest('.glass-panel, .floating-contact, .map-controls')) {
+    const target = event.target;
+    if (target instanceof Element && target.closest('.glass-panel, .floating-contact, .map-controls')) {
       return;
     }
 
-    dragState = {
-      x: event.clientX,
-      y: event.clientY,
-      startX: mapTransform.x,
-      startY: mapTransform.y
-    };
+    if (target instanceof SVGElement && target.classList.contains('plot-shape')) {
+      return;
+    }
+
+    mapViewport.setPointerCapture?.(event.pointerId);
+    setAnimatedTransform(false);
+    const point = getViewportPoint(event.clientX, event.clientY);
+    activePointers.set(event.pointerId, point);
     mapViewport.classList.add('is-dragging');
+
+    if (activePointers.size === 1) {
+      panState = {
+        pointerId: event.pointerId,
+        startPointer: point,
+        startX: mapTransform.x,
+        startY: mapTransform.y
+      };
+      pinchState = null;
+      return;
+    }
+
+    if (activePointers.size >= 2) {
+      const [first, second] = Array.from(activePointers.values());
+      const center = centerBetween(first, second);
+      const distance = Math.max(1, distanceBetween(first, second));
+      const world = getWorldPoint(center.x, center.y);
+
+      pinchState = {
+        startDistance: distance,
+        startScale: mapTransform.scale,
+        worldX: world.x,
+        worldY: world.y
+      };
+      panState = null;
+    }
   });
 
   mapViewport.addEventListener('pointermove', (event) => {
-    if (!dragState) {
+    if (!activePointers.has(event.pointerId)) {
       return;
     }
 
-    mapTransform.targetX = dragState.startX + (event.clientX - dragState.x);
-    mapTransform.targetY = dragState.startY + (event.clientY - dragState.y);
-    mapTransform.x = mapTransform.targetX;
-    mapTransform.y = mapTransform.targetY;
+    const point = getViewportPoint(event.clientX, event.clientY);
+    activePointers.set(event.pointerId, point);
 
-    if (animationFrameId === null) {
-      animateTransform();
+    if (activePointers.size >= 2 && pinchState) {
+      const [first, second] = Array.from(activePointers.values());
+      const center = centerBetween(first, second);
+      const distance = Math.max(1, distanceBetween(first, second));
+      const nextScale = clampScale(pinchState.startScale * (distance / pinchState.startDistance));
+
+      mapTransform.scale = nextScale;
+      const clampedPan = clampPan(
+        center.x - pinchState.worldX * nextScale,
+        center.y - pinchState.worldY * nextScale,
+        nextScale
+      );
+      mapTransform.x = clampedPan.x;
+      mapTransform.y = clampedPan.y;
+      scheduleMapTransform();
+      return;
+    }
+
+    if (activePointers.size === 1 && panState && panState.pointerId === event.pointerId) {
+      const clampedPan = clampPan(
+        panState.startX + (point.x - panState.startPointer.x),
+        panState.startY + (point.y - panState.startPointer.y),
+        mapTransform.scale
+      );
+      mapTransform.x = clampedPan.x;
+      mapTransform.y = clampedPan.y;
+      scheduleMapTransform();
     }
   });
 
-  ['pointerup', 'pointerleave', 'pointercancel'].forEach((eventName) => {
-    mapViewport.addEventListener(eventName, () => {
-      dragState = null;
+  const endPointerGesture = (event) => {
+    activePointers.delete(event.pointerId);
+
+    if (activePointers.size === 0) {
+      panState = null;
+      pinchState = null;
       mapViewport.classList.remove('is-dragging');
-    });
+      return;
+    }
+
+    if (activePointers.size === 1) {
+      const [pointerId, point] = Array.from(activePointers.entries())[0];
+      panState = {
+        pointerId,
+        startPointer: point,
+        startX: mapTransform.x,
+        startY: mapTransform.y
+      };
+      pinchState = null;
+      return;
+    }
+
+    const [first, second] = Array.from(activePointers.values());
+    const center = centerBetween(first, second);
+    const distance = Math.max(1, distanceBetween(first, second));
+    const world = getWorldPoint(center.x, center.y);
+
+    pinchState = {
+      startDistance: distance,
+      startScale: mapTransform.scale,
+      worldX: world.x,
+      worldY: world.y
+    };
+    panState = null;
+  };
+
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((eventName) => {
+    mapViewport.addEventListener(eventName, endPointerGesture);
   });
 }
 
@@ -797,6 +929,13 @@ window.addEventListener('keydown', (event) => {
     closeModal();
     adminDrawer.classList.add('hidden');
   }
+});
+
+window.addEventListener('resize', () => {
+  const clampedPan = clampPan(mapTransform.x, mapTransform.y, mapTransform.scale);
+  mapTransform.x = clampedPan.x;
+  mapTransform.y = clampedPan.y;
+  scheduleMapTransform();
 });
 
 initializeMap().catch((error) => {
