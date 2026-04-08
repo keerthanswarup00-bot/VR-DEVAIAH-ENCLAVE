@@ -2,6 +2,7 @@ const SVG_MAP_SOURCE = './Asset-3-source.svg';
 const ADMIN_PASSWORD = 'paavani123';
 const STORAGE_KEY = 'vrdevaiah-admin-plots-v2';
 const WHATSAPP_NUMBER = '919035060371';
+const PLOTS_API_ENDPOINT = './api/plots';
 const PLOT_NUMBER_BY_SHAPE_INDEX = [
   '39', '50', '42', '40', '44', '46', '41', '45', '43', '49',
   '47', '48', '27', '22', '24', '23', '25', '26', '28', '32',
@@ -139,7 +140,7 @@ defaultPlots.forEach((plot) => {
   }
 });
 
-const plots = loadPlots();
+let plots = loadPlots();
 
 const state = {
   searchTerm: '',
@@ -210,6 +211,10 @@ let transformFrame = 0;
 let transitionClearTimer = 0;
 let tapCandidate = null;
 
+function isApiAvailable() {
+  return window.location.protocol !== 'file:';
+}
+
 function loadPlots() {
   try {
     const saved = window.localStorage.getItem(STORAGE_KEY);
@@ -229,6 +234,66 @@ function loadPlots() {
 
 function savePlots() {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(plots));
+}
+
+async function fetchPlotsFromApi() {
+  const response = await fetch(PLOTS_API_ENDPOINT, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch plots: ${response.status}`);
+  }
+
+  const payload = await response.json();
+  return Array.isArray(payload.plots) ? payload.plots : [];
+}
+
+async function updatePlotInApi(plot) {
+  const response = await fetch(PLOTS_API_ENDPOINT, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-admin-password': ADMIN_PASSWORD
+    },
+    body: JSON.stringify({
+      plotNumber: plot.plotNumber,
+      status: plot.status,
+      sizeType: plot.sizeType,
+      dimensions: plot.dimensions,
+      areaSqm: plot.areaSqm,
+      facing: plot.facing
+    })
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || `Failed to update plot: ${response.status}`);
+  }
+
+  const payload = await response.json();
+  return payload.plot || null;
+}
+
+async function hydratePlots() {
+  if (!isApiAvailable()) {
+    return;
+  }
+
+  try {
+    const remotePlots = await fetchPlotsFromApi();
+    if (remotePlots.length) {
+      plots = defaultPlots.map((plot) => {
+        const remote = remotePlots.find((item) => String(item.plotNumber) === String(plot.plotNumber));
+        return remote ? { ...plot, ...remote } : plot;
+      });
+    }
+  } catch (error) {
+    console.warn('Using local plot data fallback.', error);
+  }
 }
 
 function sizeFill(sizeType) {
@@ -905,7 +970,7 @@ adminPlotSearch.addEventListener('change', () => {
   renderMap();
 });
 
-adminSaveButton.addEventListener('click', () => {
+adminSaveButton.addEventListener('click', async () => {
   const plot = selectedPlot();
   if (!state.isAdmin || !plot) {
     adminMessage.textContent = 'Select a plot first.';
@@ -923,7 +988,22 @@ adminSaveButton.addEventListener('click', () => {
   plot.facing = adminFacing.value;
   plot.areaSqm = (Number(adminArea.value) / 10.7639) || plot.areaSqm;
   savePlots();
-  adminMessage.textContent = `Plot ${plot.plotNumber} updated.`;
+
+  if (isApiAvailable()) {
+    try {
+      const remotePlot = await updatePlotInApi(plot);
+      if (remotePlot) {
+        Object.assign(plot, remotePlot);
+      }
+      adminMessage.textContent = `Plot ${plot.plotNumber} updated in database.`;
+    } catch (error) {
+      adminMessage.textContent = 'Saved only in this browser. Database update failed.';
+      console.error(error);
+    }
+  } else {
+    adminMessage.textContent = `Plot ${plot.plotNumber} updated locally.`;
+  }
+
   renderMap();
   if (!modal.classList.contains('hidden')) {
     openModal(plot);
@@ -971,6 +1051,11 @@ window.addEventListener('resize', () => {
   scheduleMapTransform();
 });
 
-initializeMap().catch((error) => {
-  console.error('Unable to load map SVG', error);
+async function boot() {
+  await hydratePlots();
+  await initializeMap();
+}
+
+boot().catch((error) => {
+  console.error('Unable to start site', error);
 });
