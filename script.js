@@ -208,6 +208,7 @@ let panState = null;
 let pinchState = null;
 let transformFrame = 0;
 let transitionClearTimer = 0;
+let tapCandidate = null;
 
 function loadPlots() {
   try {
@@ -651,6 +652,7 @@ async function initializeMap() {
   })).filter((entry) => entry.plot);
 
   plotShapePairs.forEach(({ plot, shape }) => {
+    shape.dataset.plotId = String(plot.id);
     shape.style.cursor = 'pointer';
     shape.addEventListener('mouseenter', () => {
       state.hoveredPlotId = plot.id;
@@ -661,11 +663,6 @@ async function initializeMap() {
         state.hoveredPlotId = null;
         renderMap();
       }
-    });
-    shape.addEventListener('click', () => {
-      state.selectedPlotId = plot.id;
-      openModal(plot);
-      renderMap();
     });
   });
 
@@ -711,15 +708,23 @@ if (mapViewport) {
       return;
     }
 
-    if (target instanceof SVGElement && target.classList.contains('plot-shape')) {
-      return;
-    }
-
     mapViewport.setPointerCapture?.(event.pointerId);
     setAnimatedTransform(false);
     const point = getViewportPoint(event.clientX, event.clientY);
     activePointers.set(event.pointerId, point);
     mapViewport.classList.add('is-dragging');
+
+    const plotShape = target instanceof SVGElement && target.classList.contains('plot-shape') ? target : null;
+    if (activePointers.size === 1 && plotShape?.dataset.plotId) {
+      tapCandidate = {
+        pointerId: event.pointerId,
+        plotId: Number(plotShape.dataset.plotId),
+        startX: point.x,
+        startY: point.y
+      };
+    } else {
+      tapCandidate = null;
+    }
 
     if (activePointers.size === 1) {
       panState = {
@@ -733,6 +738,7 @@ if (mapViewport) {
     }
 
     if (activePointers.size >= 2) {
+      tapCandidate = null;
       const [first, second] = Array.from(activePointers.values());
       const center = centerBetween(first, second);
       const distance = Math.max(1, distanceBetween(first, second));
@@ -756,7 +762,16 @@ if (mapViewport) {
     const point = getViewportPoint(event.clientX, event.clientY);
     activePointers.set(event.pointerId, point);
 
+    if (tapCandidate && tapCandidate.pointerId === event.pointerId) {
+      const deltaX = point.x - tapCandidate.startX;
+      const deltaY = point.y - tapCandidate.startY;
+      if (Math.hypot(deltaX, deltaY) > 8) {
+        tapCandidate = null;
+      }
+    }
+
     if (activePointers.size >= 2 && pinchState) {
+      tapCandidate = null;
       const [first, second] = Array.from(activePointers.values());
       const center = centerBetween(first, second);
       const distance = Math.max(1, distanceBetween(first, second));
@@ -787,12 +802,29 @@ if (mapViewport) {
   });
 
   const endPointerGesture = (event) => {
+    const pointerPoint = activePointers.get(event.pointerId);
+    const shouldOpenPlot =
+      !!tapCandidate &&
+      tapCandidate.pointerId === event.pointerId &&
+      event.type === 'pointerup' &&
+      activePointers.size === 1 &&
+      !!pointerPoint;
+
     activePointers.delete(event.pointerId);
 
     if (activePointers.size === 0) {
       panState = null;
       pinchState = null;
       mapViewport.classList.remove('is-dragging');
+      if (shouldOpenPlot) {
+        const plot = plots.find((item) => item.id === tapCandidate.plotId);
+        if (plot) {
+          state.selectedPlotId = plot.id;
+          openModal(plot);
+          renderMap();
+        }
+      }
+      tapCandidate = null;
       return;
     }
 
@@ -820,6 +852,7 @@ if (mapViewport) {
       worldY: world.y
     };
     panState = null;
+    tapCandidate = null;
   };
 
   ['pointerup', 'pointercancel', 'pointerleave'].forEach((eventName) => {
